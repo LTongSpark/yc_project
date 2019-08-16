@@ -1,0 +1,100 @@
+package com.zytc.yc.spark.seneitiveInfo.analyse
+
+import com.typesafe.config.Config
+import com.zytc.yc.spark.config.GlobalConfig
+import com.zytc.yc.spark.seneitiveInfo.SensBean
+import com.zytc.yc.spark.util.{JdbcUtil, ParseUserId}
+import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.spark.sql.Row
+import org.apache.spark.streaming.dstream.InputDStream
+
+/**
+  * 查询/导出数据量异常
+  * (JAVA)时间约束:前一天的18:00 到当天的18:00,步长1分钟
+  * (Scala) window:[长度不需计算,推进频率1分钟]
+  */
+object AffectAbnormal {
+
+    /**
+      * 分析数据
+      *
+      * @param config     系统配置文件对象
+      * @param streamData 单一批次数据
+      */
+    def affect(config: Config, streamData: InputDStream[ConsumerRecord[String, String]]): Unit = {
+        //获取系统阈值
+        val thresholdValue: Int = GlobalConfig.threshold.getOrElse("affectAbnormal", 100000)
+        print(thresholdValue)
+        //对批次数据进行过滤分析操作
+        val json = streamData.map(_.value()) //取出所有批次数据json
+            .map(rdd => SensBean.operationBean(rdd)) //json解析(解析后的数据每一个字段都有可能没有，即->(,,,,),可以保证是操作类型日志并且有Do的值)
+            .filter(_.infotype.toLowerCase == "sensitivelog")
+            .filter(x => (x.operation_act_do == "select")) //做非可用数据的清洗
+            .map(x => {
+            var flag = ""
+            var dataClass = 0
+            var isViolations = 0 //是否违规(超出阀值)
+            if (x.optional_dataClass == "") dataClass = 0
+            else dataClass = x.optional_dataClass.toInt
+            var affect = 0
+            if (x.operation_act_affect == "") affect = 0
+            else affect = x.operation_act_affect.toInt
+            if (affect >= thresholdValue) {
+                isViolations = 1
+                flag = x.base_timestamp + "_" + x.interfaceNo
+            }
+            Row(ParseUserId.parse(x.base_userId)._1, x.interfaceNo, x.infotype,
+                x.base_userType, x.base_hostname, x.base_client, x.base_ip,
+                x.base_timestamp, x.base_originalLogId, x.base_originalCMD,
+                x.operation_type, x.operation_abnormal,
+                x.operation_act_do, x.operation_act_useTime, affect,
+                dataClass, x.optional_tablename, x.optional_databasename,
+                x.optional_fieldname, x.origin_content,
+                isViolations, flag, ParseUserId.parse(x.base_userId)._2)
+        })
+            .foreachRDD(rdd => {
+                rdd.foreachPartition(it => {
+                    try {
+                        val conn = JdbcUtil.createConn(config)
+                        val ppst = conn.prepareStatement("insert into biz_log_affectabnormal(" +
+                            "user_id,interface_no,infotype,user_type,hostname,client,ip,timestamp," +
+                            "original_logid,original_cmd,type,abnormal,opra_type,use_time,affect," +
+                            "data_class,table_name,database_name,field_name,origin_content,isViolations," +
+                            "abnormal_tag,send_to) " +
+                            "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                        for (e <- it) {
+                            ppst.setString(1, e.getString(0))
+                            ppst.setString(2, e.getString(1))
+                            ppst.setString(3, e.getString(2))
+                            ppst.setString(4, e.getString(3))
+                            ppst.setString(5, e.getString(4))
+                            ppst.setString(6, e.getString(5))
+                            ppst.setString(7, e.getString(6))
+                            ppst.setString(8, e.getString(7))
+                            ppst.setString(9, e.getString(8))
+                            ppst.setString(10, e.getString(9))
+                            ppst.setString(11, e.getString(10))
+                            ppst.setString(12, e.getString(11))
+                            ppst.setString(13, e.getString(12))
+                            ppst.setString(14, e.getString(13))
+                            ppst.setInt(15, e.getInt(14))
+                            ppst.setInt(16, e.getInt(15))
+                            ppst.setString(17, e.getString(16))
+                            ppst.setString(18, e.getString(17))
+                            ppst.setString(19, e.getString(18))
+                            ppst.setString(20, e.getString(19))
+                            ppst.setInt(21, e.getInt(20))
+                            ppst.setString(22, e.getString(21))
+                            ppst.setString(23, e.getString(22))
+                            println("biz_log_affectAbnormal" + "插入完成")
+                            ppst.executeUpdate()
+                        }
+                        conn.close()
+                        ppst.close()
+                    } catch {
+                        case e: Exception => print("")
+                    }
+                })
+            })
+    }
+}
